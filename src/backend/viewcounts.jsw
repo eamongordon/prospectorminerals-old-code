@@ -1,0 +1,14 @@
+import wixData from 'wix-data';
+//import wixUsersBackend from 'wix-users-backend';
+
+export function updateViewCount (item, databaseName, prevcount) {
+	item.views = prevcount + 1;
+	wixData.update(databaseName, item, {
+            suppressAuth: true
+    });
+}
+/*
+export function trest() {
+    wixData.insert("LoginSettings", {_id:w ixUsersBackend.currentUser.id})
+}
+*/

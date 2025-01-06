@@ -1,0 +1,10 @@
+{
+    "contentCollectionKey": "EmailVerificationCodes",
+    "expiryTime": "15",
+    "displayName": "Prospector Minerals",
+    "logoUrl": "https://static.wixstatic.com/media/2dcc6c_fcbd08c3c8f64a668bb913a5c82df528~mv2.png",
+    "fromEmail": "prospectorminerals@prospectorminerals.com",
+    "smtphost": "smtp.mail.me.com",
+    "smtpport": "587",
+    "smtpuser": "ekeokigordon@icloud.com"
+}

@@ -1,0 +1,480 @@
+import { members, authentication, currentMember } from 'wix-members-backend';
+import { mediaManager } from 'wix-media-backend';
+import { deleteUsers } from '@prospectorminerals/memberfunctions-backend';
+import wixData from 'wix-data';
+import crypto from 'crypto';
+const he = require('he');
+
+const queryOptions = { suppressAuth: true };
+
+export async function getPostDates() {
+    const posts = await wixData.query("Blog/Posts").fields("publishedDate", "title").find();
+    return posts.items.map((obj) => {return {...obj, publishedDate: obj.publishedDate.toISOString()}})
+}
+
+export async function updateMinerals() {
+    const allResults = await wixData.query("Photos").limit(1000).find();
+    const allResultsMapped = allResults.items.map((obj) => {
+        const formattedImage = "https://static.wixstatic.com/media/" + obj.image.replace('image://v1/', '').replace('wix:', '').substr(0, obj.image.replace('image://v1/', '').replace('wix:', '').lastIndexOf('/'));
+        let splitSizeArr = obj.size?.replace("cm", "").split("x") || [];
+        const fileImageArray = formattedImage.split('.');
+        const fileExtension = fileImageArray[fileImageArray.length - 1];
+        return {
+            "title": obj.specimenName,
+            "description": obj.description,
+            "image": formattedImage,
+            "specimen_length": splitSizeArr.length > 0 ? Number(splitSizeArr[0]) : undefined,
+            "specimen_width": splitSizeArr.length > 1 ? Number(splitSizeArr[1]) : undefined,
+            "specimen_height": splitSizeArr.length > 2 ? Number(splitSizeArr[2]) : undefined,
+            "specimen_size": obj.size,
+            "specimen_number": obj.specimenNumber,
+            "mineral_names": obj.mineralsInPhotoArray,
+            "id": obj._id,
+            "fileExtension": `image/${fileExtension}`
+        }
+    });
+    return allResultsMapped;
+}
+
+export async function retreieveMinerals() {
+    const allResults = await wixData.query("Database").limit(100).ascending("title").find();
+    const allResultsMapped = allResults.items.map((obj) => {
+        return {
+            "id": obj._id,
+            "name": obj.title,
+            "mineral_class": obj.mineralClass,
+            "crystal_system": obj.crystalSystem,
+            "chemical_formula": obj.chemicalFormula,
+            "varieties": obj.varietiesArray,
+            "lusters": obj.luster.split(", "),
+            "streak": obj.streak,
+            "hardness_min": obj.hardnessMin,
+            "hardness_max": obj.hardnessMax,
+            "description": obj.description ? he.decode(obj.description.replace(/(<([^>]+)>)/ig, "").replace(/(&rsquo;)/ig, "'").replace(/\r?\n/g, "")) : null,
+            "uses": obj.uses ? he.decode(obj.uses.replace(/(<([^>]+)>)/ig, "").replace(/(&rsquo;)/ig, "'").replace(/\r?\n/g, "")) : null,
+            "localities_description": obj.notableLocalities ? he.decode(obj.notableLocalities.replace(/(<([^>]+)>)/ig, "").replace(/(&rsquo;)/ig, "'").replace(/\r?\n/g, "")) : null,
+        }
+    });
+    return allResultsMapped.filter((obj) => obj.name !== "AASample");
+}
+
+export async function retrievePhotosMineralRelations() {
+    let allResultsQuery = await wixData.query("Photos").limit(50).ascending("title").include("mineralsInPhoto").find();
+    let allResults = allResultsQuery.items;
+    while (allResultsQuery.hasNext()) {
+        allResultsQuery = await allResultsQuery.next();
+        allResults = allResults.concat(allResultsQuery.items)
+    }
+    let allRelations = [];
+    allResults.forEach((photo) => {
+        if (photo.mineralsInPhoto) {
+            photo.mineralsInPhoto.forEach((mineral) => {
+                allRelations.push({ mineral: mineral._id, photo: photo._id })
+            })
+        }
+    });
+    return allRelations;
+}
+
+export async function retrieveLocalities() {
+    const allResults = await wixData.query("LocalityDatabase").find();
+    const allPhotos = await wixData.query("Photos").hasSome("locality", allResults.items.map((obj) => obj.title.slice(0, 5))).find();
+    let allResultsMapped = [];
+
+    for (const obj of allResults.items) {
+        const wixDataQuery = await wixData.queryReferenced("LocalityDatabase", obj._id, "significantMinerals");
+        allResultsMapped.push({
+            "id": obj._id,
+            "name": obj.title,
+            "type": obj.type.includes("single") ? "Single" : "Group",
+            "coordinates_known": obj.type.includes("estimated") ? true : false,
+            "description": obj.description ? he.decode(obj.description.replace(/(<([^>]+)>)/ig, "").replace(/(&rsquo;)/ig, "'").replace(/\r?\n/g, "")) : null,
+            "latitude": obj.latitude,
+            "longitude": obj.longitude,
+            "minerals": obj.mineralsArray,
+        });
+    }
+
+    return allResultsMapped;
+}
+
+export async function retrievePhotos() {
+    const allPhotos = await wixData.query("Photos").limit(1000).find();
+    const allResultsMapped = allPhotos.items.map((obj) => {
+        return {
+            "_id": obj._id,
+            "locality": obj.locality
+        }
+    })
+    return allResultsMapped;
+}
+
+export async function loginClassic(email, password) {
+    try {
+        const twofaresult = await checktwofaStatus(email);
+        if (twofaresult.result === true) {
+            throw new Error("Member has two factor authentication enabled.");
+        } else {
+            const sessionToken = await authentication.login(email, password);
+            return sessionToken;
+        }
+    } catch (error) {
+        if (error.details.applicationError.code === '-19976') {
+            throw new Error("incorrectpassword");
+        } else {
+            throw new Error(error);
+        }
+    }
+}
+
+export async function checktwofaStatus(email) {
+    try {
+        const dataResults = await wixData.query("LoginSettings").eq("email", email).find(queryOptions);
+        if (dataResults.items && dataResults.items.length > 0 && dataResults.items[0].twoFactorAuthEnabled) {
+            return { result: true, channel: dataResults.items[0].twoFactorAuthMethods[0] };
+        } else {
+            return { result: false };
+        }
+    } catch (error) {
+        throw new Error(error);
+    }
+}
+
+export function changeMemberLoginEmail(memberId, newEmail) {
+    return authentication.changeLoginEmail(memberId, newEmail)
+        .then((updatedMember) => {
+            return { status: true };
+        })
+        .catch((error) => {
+            Promise.reject(error);
+        })
+}
+
+export function updateData(id, member, prefs) {
+    /*
+  if (member.contactDetails.phones[0]){ 
+  console.log(member.contactDetails.phones[0]);
+	return members.updateMember(id, member)
+    .then((member) => {
+		  return {
+        status: true,
+        member: member
+      };
+    })
+    .catch((error) => {
+      return {
+        status: false,
+        error: error
+      }
+    })
+  } else {
+    */
+    //delete member.contactDetails.phones;
+    return members.updateMember(id, member)
+        .then((member) => {
+            if (prefs.deletePhones === true) {
+                members.deleteMemberPhones(id).then(() => {
+                    return {
+                        status: true,
+                        member: member
+                    };
+                }).catch((error) => {
+                    Promise.reject(error);
+                })
+            } else {
+                return {
+                    status: true,
+                    member: member
+                };
+            }
+        })
+        .catch((error) => {
+            Promise.reject(error);
+        })
+    //}
+}
+
+export async function checkMember(email) {
+    try {
+        const queryResults = await wixData.query('Members/PrivateMembersData').eq('loginEmail', email).find(queryOptions);
+        if (queryResults && queryResults.items && queryResults.items.length > 0) {
+            return { results: true, id: queryResults.items[0]._id };
+        } else {
+            return { results: false };
+        }
+    } catch (err) {
+        throw new Error('original error - ' + err.message);
+    }
+}
+
+export async function socialLoginUpdateMember(data) {
+    const namearray = data.name.split(" ");
+    const firstName = namearray[0];
+    const lastName = namearray[1];
+    checkMember()
+        .then((res) => {
+            if (res.results === true) {
+                //importFile(data.avatar)
+                //.then((fileData) => {
+                console.log(firstName + lastName);
+                let member = {
+                    contactDetails: {
+                        firstName: firstName,
+                        lastName: lastName
+                    },
+                    /*
+          profile: {
+            profilePhoto: {
+				      url: fileData.fileUrl
+			      }
+          }
+          */
+                }
+                console.log(res.id);
+                updateData(res.id, member).then((message) => {
+                    console.log('UpdatedData - ' + message);
+                }).catch((err) => {
+                    console.log(err);
+                });
+                //}).catch( (err) => {
+                //console.log(err);
+                //});
+
+            }
+        })
+}
+
+export async function generateToken(email, contactInfo) {
+    const { firstName, lastName, picture } = contactInfo;
+    if (email) {
+        const queryResults = await wixData.query('Members/PrivateMembersData').eq('loginEmail', email).find(queryOptions);
+        if (queryResults && queryResults.items && queryResults.items.length > 0) {
+            return authentication.generateSessionToken(email)
+                .then((sessionToken) => {
+                    return {
+                        sessionToken: sessionToken,
+                        approved: true
+                    };
+                })
+                .catch((err) => {
+                    console.log(err);
+                });
+        } else {
+            let password = crypto.randomBytes(32).toString('hex');
+            let profilePicObj = await importFile(picture);
+            let profilePicUrl = `https://static.wixstatic.com/media/${profilePicObj.fileName}`;
+            return registerNewUser(email, password, { contactInfo: { firstName: firstName, lastName: lastName, picture: profilePicUrl }, })
+                .then((sessionToken) => {
+                    console.log('New User - ' + sessionToken);
+                    return {
+                        sessionToken: sessionToken,
+                        approved: true
+                    };
+                });
+        }
+    } else {
+        Promise.reject(new Error('No Email Provided'));
+    }
+}
+
+export function importFile(url) {
+    return mediaManager.importFile(
+            "/Member Profile Pics",
+            url, {
+                "mediaOptions": {
+                    "mediaType": "image"
+                },
+                "metadataOptions": {
+                    "isPrivate": false,
+                    "isVisitorUpload": true,
+                },
+            }
+        )
+        .then((filedata) => {
+            return filedata;
+        })
+        .catch((err) => {
+            console.log('profilePhoto Upload Unsuccesful -' + err + url)
+        });
+}
+
+/*
+export async function checkMemberData() {
+    const member = await currentMember.getMember();
+    const userId = member._id;
+    wixData.query("FavoriteItems")
+        .eq("userId", userId)
+        .find({
+            suppressAuth: true
+        })
+        .then((results) => {
+            if (results.items.length === 0) {
+                insertfavorites(userId);
+            }
+        });
+    wixData.query("MemberAPIUsage")
+        .eq("_id", userId)
+        .find({
+            suppressAuth: true
+        })
+        .then((results) => {
+            if (results.items.length === 0) {
+                insertmemberusage(userId);
+            }
+        });
+}
+*/
+
+/*
+function insertmemberusage(userId) {
+    var resetTime = new Date()
+    resetTime.setDate(resetTime.getDate() + 30);
+    const devInsert = {
+        "title": userId,
+        "id": userId,
+        "_id": userId,
+        "limit": 200,
+        "requests": 0,
+        "resetTime": resetTime,
+    }
+    // add the item to the collection
+    return wixData.insert("MemberAPIUsage", devInsert, { suppressAuth: true })
+        .then((res) => {
+            return { status: true }
+        })
+        .catch((err) => {
+            return { status: false, error: err };
+        });
+}
+
+function insertfavorites(userId) {
+    const favInsert = {
+        "userId": userId,
+        "_id": userId,
+    }
+    return wixData.insert("FavoriteItems", favInsert, { suppressAuth: true })
+        .then((res) => {
+            return { status: true }
+        })
+        .catch((err) => {
+            return { status: false, error: err };
+        });
+}
+*/
+export function registerNewUser(email, password, options) {
+    return authentication.register(email, password, options)
+        .then((registrationResult) => {
+            const loginSettingsObj = {
+                "_id": registrationResult.member._id,
+                "_owner": registrationResult.member._id,
+                "memberIdReference": registrationResult.member._id,
+                "passwordEnabled": true
+            };
+            wixData.insert("LoginSettings", loginSettingsObj, { suppressAuth: true });
+            if (registrationResult.status === "PENDING") {
+                return approvebyToken(registrationResult.approvalToken)
+                    .then((tokenobject) => {
+                        console.log()
+                        console.log('RegisterNewUser Pending Session Token - ' + tokenobject.sessionToken);
+                        return tokenobject.sessionToken;
+                    })
+            } else {
+                console.log('RegisterNewUser Automatic Session Token - ' + registrationResult.sessionToken);
+                return registrationResult.sessionToken;
+            }
+        })
+        .catch((error) => {
+            Promise.reject(error);
+        })
+}
+
+export function approvebyToken(approvalToken) {
+    return authentication.approveByToken(approvalToken)
+        .then((sessionToken) => {
+            console.log('approvebyToken given SessionToken - ' + sessionToken)
+            return {
+                sessionToken: sessionToken,
+                approved: true
+            }
+        })
+        .catch((error) => {
+            console.error(error);
+        })
+}
+
+export function sendSetPasswordEmailFunction(email, options) {
+    return authentication.sendSetPasswordEmail(email)
+        .then(() => {
+            Promise.resolve();
+        })
+        .catch((error) => {
+            Promise.reject(error);
+        })
+}
+
+/*
+export async function addLoginSettings() {
+    const queryResults = await wixData.query('Members/PrivateMembersData').find(queryOptions);
+    const idList = queryResults.items.map((obj) => obj._id);
+    const loginSettingsInsert = idList.map((id) => {
+        return {
+            "_id": id,
+            "_owner": id,
+            "memberIdReference": id,
+            "passwordEnabled": true,
+        }
+    });
+    return wixData.bulkInsert("LoginSettings", loginSettingsInsert, {suppressAuth: true}).then(() => {
+        Promise.resolve();
+    })
+}
+*/
+// Example options value:
+// {
+//    contactInfo: {
+//      firstName: 'Javier',
+//      lastName: 'Doe'
+//    },
+//    privacyStatus: 'PUBLIC'
+// }
+
+/* Promise resolves to:
+ * {
+ *   "member": {
+ *     "_id": "efaaf13f-934e-4449-b0c2-304030767671",
+ *     "createdDate": "2021-08-01T12:28:42Z",
+ *     "updatedDate": "2021-08-01T12:28:41.847Z",
+ *     "status": "UNKNOWN",
+ *     "contactId": "efaaf13f-934e-4449-b0c2-304030767671",
+ *     "profile": {
+ *       "nickname": "Javier Doe",
+ *       "slug": "javierdoe"
+ *     },
+ *     "privacyStatus": "UNKNOWN",
+ *     "activityStatus": "UNKNOWN"
+ *   },
+ *   "status": "PENDING",
+ *   "approvalToken": "JWS.eyJraWQiOiJSc012MmV3MiIsImFsZyI6IkhTMjU2In0.eyJkYXRhIjoie1wiaWRcIjpcImVmYWFmMTNmLTkzNGUtNDQ0OS1iMGMyLTMwNDAzMDc2NzY3MVwiLFwiY29sbGVjdGlvbklkXCI6XCI5YmVjNThlNi02NDExLTQ5OTEtOGU1ZC0wYWRhOTE4MmI5NWVcIn0iLCJpYXQiOjE2Mjc4MjA5MjEsImV4cCI6MTYyNzkyODkyMX0.zOuE8ZXRBQT4tPPFqvseE8xKm6kHrmHG3Lrndz7l7Ng"
+ * }
+ */
+
+/* Returns a promise that resolves to:
+ *
+ * {
+ *   "fileName": "f6c0f9_tg439f4475a749e181dd14407fdbd37e~mv2.jpg",
+ *   "fileUrl": "media/f6c0f9_tg439f4475a749e181dd14407fdbd37e~mv2.jpg",
+ *   "hash": "Ew00kXbu4Zt33rzjcWa6Ng==",
+ *   "sizeInBytes": 51085,
+ *   "mimeType": "image/jpeg",
+ *   "mediaType": "image",
+ *   "isPrivate": false,
+ *   "parentFolderId": "2bf470f5be194b319cdb2accc3278ff9",
+ *   "originalFileName": "my-image.jpg",
+ *   "sourceUrl": "https://somedomain.com/img/original-name.jpg",
+ *   "opStatus": "IN-DOWNLOAD-QUEUE"
+ * }
+ */
+
+export function deleteUsersHandle() {
+    deleteUsers();
+}
